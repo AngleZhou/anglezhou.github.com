@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>AngleZhou</title>
+  
+  <link href="/atom.xml" rel="self"/>
+  
+  <link href="https://anglezhou.github.io/"/>
+  <updated>2016-10-07T08:02:36.000Z</updated>
+  <id>https://anglezhou.github.io/</id>
+  
+  <author>
+    <name>Zhou Qian</name>
+    
+  </author>
+  
+  <generator uri="http://hexo.io/">Hexo</generator>
+  
+  <entry>
+    <title>AFNetworking源码阅读(一)</title>
+    <link href="https://anglezhou.github.io/2016/10/07/AFNetworking%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB-%E4%B8%80/"/>
+    <id>https://anglezhou.github.io/2016/10/07/AFNetworking源码阅读-一/</id>
+    <published>2016-10-07T07:09:00.000Z</published>
+    <updated>2016-10-07T08:02:36.000Z</updated>
+    
+    <content type="html"><![CDATA[<p>AFNetworking 3.1.0 主要是对NSURLSession做了封装.</p>
+<pre><code>- 核心类是AFURLSessionManager.
+- 其派生子类AFHTTPSessionManager基于HTTP协议的请求方式进一步封装了GET, HEAD, POST, PATCH, DELETE, PUT等方法.
+- AFURLRequestSerialization提供了请求序列化
+- AFURLResponseSerialization把收到的二进制数据序列化成JSON, XML,HTTP, PropertyList, Image等便于解析的格式。
+- AFNetworkReachabilityManager监测网络状态
+- AFSecurityPolicy提供安全验证机制
+</code></pre><p></p><h2><strong>AFURLSessionManager</strong></h2><br>这个模块主要包括两个类：<strong>AFURLSessionManager</strong>和<strong>AFURLSessionManagerTaskDelegate</strong>.<br>AFURLSessionManager用NSURLSessionConfiguration来初始化，并维护<p></p>
+<blockquote>
+<p>1.一个NSOperationQueue,<br>2.一个responseSerializer（默认JSON）<br>3.securityPolicy<br>4.reachabilityManager<br>5.一个存储taskID和TaskDelegate的字典来维护task，读写锁保护(NSLock)</p>
+</blockquote>
+<p>configuration可以设置cache policy，timeout，networkService, TSL, cookie, HTTPHeader, Credential Storage等。</p>
+<p>AFURLSessionManager主要实现了四个协议:</p>
+<blockquote>
+<p>NSURLSessionDelegate（处理session失效和验证）<br>NSURLSessionTaskDelegate（普通的请求任务处理）<br>NSURLSessionDataDelegate（数据处理）<br>NSURLSessionDownloadDelegate（下载任务处理）</p>
+</blockquote>
+<p>每个实现的协议方法都有一个对应的block，方法调用的时候执行block，如果没有再执行默认操作。</p>
+<p>把任务完成，数据处理，上传下载进度管理，下载完成后文件拷贝等部分独立出来，专门用一个类AFURLSessionManagerTaskDelegate来管理，所以这个类也实现了后3个协议。</p>
+<p>这个模块中有<font color="red">两个全局的dispatch_queue：</font></p>
+<font color="black">1. 一个是串行队列用于创建任务<br>    dataTask(普通任务), uploadTask, downloadTask以dispatch_sync的方式放入队列<br>2. 一个是并发队列用于处理任务<br>    NSURLSessionTaskDelegate的didComplete方法，如果没有错误，把响应序列化，完成处理等封装成一个block放入此并发队列中。<br><br>3. 还有一个dispatch_group_t，用来管理维护所有task的completionBlock。完成回调的处理在主队列里面。</font>
+
+<p>另外，SessionManager还维护了一个NSOperationQueue, 这个队列的最大并发数是1，等于串行。这个队列是用来处理NSURLSession的delegate回调和session的completion回调。这个completion回调是等到session中所有的data, upload, download task都结束的时候调的。这个回调主要做了一件事，给所有的task设置一个taskDelegate。既然所有任务都结束了，此刻的delegate设置有什么用呢？并且在创建任务的时候就已经设置过taskDelegate了。</p>
+<p>那么跑一个程序看一下。</p>
+<p>客户端发起第一个请求Get</p>
+<ol>
+<li>创建请求的时候发生在main queue里，如果iOS8以下是在创建任务的串行队列里</li>
+<li><strong>NSURLSessionDelegate</strong>的<strong>didReceiveChallenge</strong>得到调用，此时运行在NSOperationQueue。</li>
+<li>NSURLSessionDataDelegate的didReceiveData得到调用，此时运行在NSOperationQueue</li>
+<li>sessionManager的NSURLSessionTaskDelegate的didCompleteWithError得到调用，方法中再去调用taskDelegate的didCompleteWithError方法，此时运行在NSOperationQueue。response序列化在processing_dispatch_queue中调用，taskDelegate在此方法中被移除。</li>
+</ol>
+<p>可以看出所有delegate的方法回调都是在session的operationQueue里发生，请求创建在main queue或者<strong>create_dispatch_queue</strong>中发生，response序列化在<strong>processing_dispatch_queue</strong>里发生。创建结束并没有调用session的completionHandler，在sessionManager初始化时会调用一次，此时没有task。进到getTasksWithCompletionHandler方法定义处，发现注释completionHandler是用来处理未解决的data, upload, download task，猜想应该是在session意外invalide的时候，若此时有未解决的task，在session结束之前会在这里集中处理一遍。</p>
+<hr>
+<p></p><h1><strong>技巧</strong></h1><p></p>
+<h3>1.<strong>NSStringFromSelector(_cmd)</strong>获取当前运行方法的名字</h3>
+
+<h3>2.信号量</h3>
+
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div></pre></td><td class="code"><pre><div class="line">dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);//创建一个信号量计数==0</div><div class="line">dispatch_semaphore_signal(semaphore);//计数+1</div><div class="line">dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);//如果semaphore计数&gt;=1,计数-1，返回，程序继续运行；如果计数==0，一直等待</div></pre></td></tr></table></figure>
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div><div class="line">5</div><div class="line">6</div><div class="line">7</div><div class="line">8</div><div class="line">9</div><div class="line">10</div><div class="line">11</div><div class="line">12</div><div class="line">13</div><div class="line">14</div><div class="line">15</div><div class="line">16</div><div class="line">17</div><div class="line">18</div></pre></td><td class="code"><pre><div class="line">- (NSArray *)tasksForKeyPath:(NSString *)keyPath &#123;</div><div class="line">   	__block NSArray *tasks = nil;</div><div class="line">   	dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);</div><div class="line">   	[self.session getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) &#123;</div><div class="line">      	 if ([keyPath isEqualToString:NSStringFromSelector(@selector(dataTasks))]) &#123;</div><div class="line">           tasks = dataTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(uploadTasks))]) &#123;</div><div class="line">           tasks = uploadTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(downloadTasks))]) &#123;</div><div class="line">           tasks = downloadTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(tasks))]) &#123;</div><div class="line">           tasks = [@[dataTasks, uploadTasks, downloadTasks] valueForKeyPath:@&quot;@unionOfArrays.self&quot;];</div><div class="line">       &#125;</div><div class="line">       	dispatch_semaphore_signal(semaphore);</div><div class="line">   	&#125;];</div><div class="line">  	 dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);</div><div class="line">  	 return tasks;</div><div class="line">&#125;</div></pre></td></tr></table></figure>
+<p>这个方法利用信号量，把异步返回的task，变为同步。也就是说，当CompletionHandler执行前，信号量一直为0，当前线程阻塞直到CompletionHandler执行，信号量+1，返回task。</p>
+<h3>3.用method_swizzling给resume和suspend方法加上发通知</h3>
+
+<h3>4.对某处的代码忽略警告。push存储GCC的当前诊断状态，pop恢复到存储的诊断状态，push和pop使忽略效果只在之间生效。</h3>
+
+
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div></pre></td><td class="code"><pre><div class="line">#pragma GCC diagnostic push</div><div class="line">#pragma GCC diagnostic ignored &quot;-Wnonnull&quot;</div><div class="line">        NSURLSessionDataTask *localDataTask = [session dataTaskWithURL:nil];</div><div class="line">#pragma clang diagnostic pop</div></pre></td></tr></table></figure>]]></content>
+    
+    <summary type="html">
+    
+      &lt;p&gt;AFNetworking 3.1.0 主要是对NSURLSession做了封装.&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;- 核心类是AFURLSessionManager.
+- 其派生子类AFHTTPSessionManager基于HTTP协议的请求方式进一步封装了GET, HEA
+    
+    </summary>
+    
+    
+  </entry>
+  
+  <entry>
+    <title>高效地给图片加圆角</title>
+    <link href="https://anglezhou.github.io/2016/10/07/%E9%AB%98%E6%95%88%E5%9C%B0%E7%BB%99%E5%9B%BE%E7%89%87%E5%8A%A0%E5%9C%86%E8%A7%92/"/>
+    <id>https://anglezhou.github.io/2016/10/07/高效地给图片加圆角/</id>
+    <published>2016-10-07T07:05:12.000Z</published>
+    <updated>2016-10-08T06:33:59.000Z</updated>
+    
+    <content type="html"><![CDATA[<p>最近研究了一下如何高效地给图片加圆角这个问题，总结一下常用的三种方法：</p>
+<p></p><h3>1.setCornerRadius &amp;&amp; maskToBounds</h3><br>最简单直接，不考虑性能或者圆角较少的时候使用。如果只用setCornerRadius，不会引起离屏渲染（引起离屏渲染的是setCornerRadius <strong>+</strong> maskToBounds），所以不会影响性能。<p></p>
+<p></p><h3>2.UIKit绘制圆角</h3><p></p>
+<blockquote>
+<p>UIGraphicsBeginImageContextWithOptions &amp; UIImage -drawInRect:</p>
+</blockquote>
+<p>此方法提高性能的原理是自己实现离屏渲染，放在后台线程运行，从而提高CPU利用率防止主线程阻塞。<br>可以给UIImageView或者Image加一个category，直接绘制一个圆形的图片。</p>
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div><div class="line">5</div><div class="line">6</div><div class="line">7</div><div class="line">8</div></pre></td><td class="code"><pre><div class="line">UIGraphicsBeginImageContextWithOptions(size, NO, scale);</div><div class="line">UIBezierPath *outterPath = [UIBezierPath bezierPathWithRoundedRect:rectMask cornerRadius:radius];</div><div class="line">[outterPath addClip];</div><div class="line">[originalImage drawInRect:CGRectMake(0, 0, size.width, size.height)];</div><div class="line">UIImage *getImage = UIGraphicsGetImageFromCurrentImageContext();</div><div class="line">UIGraphicsEndImageContext();</div><div class="line">CGImageRef imageRef = CGImageCreateWithImageInRect(getImage.CGImage, CGRectMake(rectMask.origin.x, rectMask.origin.y, radius*scale, radius*scale));</div><div class="line">UIImage *img = [UIImage imageWithCGImage:imageRef];</div></pre></td></tr></table></figure>
+<p>1: 先创建一个临时的指定size的context.<br>2~6: 添加圆形的UIBezierPath，剪切，再将图片绘制到context中，会得到一个内容为圆形的矩形图片。(这里可以直接创建正方形的context，从context创建的图片为一个四角透明的正方形图片直接使用，但是图片可能产生形变，类似ScaleToFill的效果，不是图片本身的宽高比压缩所以会形变)<br>7~8: (可以创建一个按比例缩小的context，然后绘制)再把context创建的图片从<em>CGImageCreateWithImageInRect</em>剪裁成正方形，类似AspectToFill的效果，图片没有形变但不能完整显示，边缘部分会被剪掉。</p>
+<p></p><h3>3.Core Graphics绘制圆角</h3> <p></p>
+<blockquote>
+<p>CGBitmapContextCreate &amp; CGContextDrawImage<br>思路跟方法2相同，只是创建context及绘制用的是CoreGraphics API。</p>
+</blockquote>
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div><div class="line">5</div><div class="line">6</div><div class="line">7</div><div class="line">8</div><div class="line">9</div><div class="line">10</div><div class="line">11</div><div class="line">12</div><div class="line">13</div><div class="line">14</div><div class="line">15</div><div class="line">16</div><div class="line">17</div><div class="line">18</div><div class="line">19</div></pre></td><td class="code"><pre><div class="line">size_t bitsPerComponent = CGImageGetBitsPerComponent(inImage);</div><div class="line">   size_t bytesPerRow = CGImageGetBytesPerRow(inImage);</div><div class="line">   CGColorSpaceRef colorSpace = CGImageGetColorSpace(inImage);</div><div class="line">   CGBitmapInfo bitMapInfo = CGImageGetBitmapInfo(inImage);</div><div class="line">   CGContextRef context = CGBitmapContextCreate(nil,</div><div class="line">                                                size.width,</div><div class="line">                                                size.height,</div><div class="line">                                                bitsPerComponent,</div><div class="line">                                                bytesPerRow,</div><div class="line">                                                CGColorSpaceCreateDeviceRGB(),</div><div class="line">                                                kCGImageAlphaPremultipliedFirst);</div><div class="line">   CGContextSetInterpolationQuality(context, kCGInterpolationHigh);</div><div class="line">   UIBezierPath *outterPath = [UIBezierPath bezierPathWithRoundedRect:rectMask 	cornerRadius:radius];</div><div class="line">[outterPath addClip];</div><div class="line">UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:radius*scale];</div><div class="line">   CGContextAddPath(context, path.CGPath);</div><div class="line">   CGContextClip(context);</div><div class="line">   CGContextDrawImage(context, CGRectMake(0, 0, outSize.width, outSize.height), self.CGImage);</div><div class="line">   CGImageRef cgImage = CGBitmapContextCreateImage(context);</div></pre></td></tr></table></figure>
+<p>点击查看<a href="https://github.com/AngleZhou/ZQImageViewRoundCorner" target="_blank" rel="external">Demo</a></p>
+]]></content>
+    
+    <summary type="html">
+    
+      &lt;p&gt;最近研究了一下如何高效地给图片加圆角这个问题，总结一下常用的三种方法：&lt;/p&gt;
+&lt;p&gt;&lt;/p&gt;&lt;h3&gt;1.setCornerRadius &amp;amp;&amp;amp; maskToBounds&lt;/h3&gt;&lt;br&gt;最简单直接，不考虑性能或者圆角较少的时候使用。如果只用setCorner
+    
+    </summary>
+    
+    
+  </entry>
+  
+</feed>

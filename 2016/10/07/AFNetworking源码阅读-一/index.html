@@ -1,0 +1,46 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="X-UA-Compatible" content="IE=edge"><title> AFNetworking源码阅读(一) · AngleZhou</title><meta name="description" content="AFNetworking源码阅读(一) - Zhou Qian"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="short icon" href="/favicon.png"><link rel="stylesheet" href="/css/apollo.css"><link rel="search" type="application/opensearchdescription+xml" href="https://anglezhou.github.io/atom.xml" title="AngleZhou"></head><body><div class="wrap"><header><a href="/" class="logo-link"><img src="/favicon.png"></a><ul class="nav nav-list"><li class="nav-list-item"><a href="/" target="_self" class="nav-list-link">BLOG</a></li><li class="nav-list-item"><a href="/archives/" target="_self" class="nav-list-link">ARCHIVE</a></li><li class="nav-list-item"><a href="https://github.com/AngleZhou" target="_blank" class="nav-list-link">GITHUB</a></li><li class="nav-list-item"><a href="/atom.xml" target="_self" class="nav-list-link">RSS</a></li></ul></header><section class="container"><div class="post"><article class="post-block"><h1 class="post-title">AFNetworking源码阅读(一)</h1><div class="post-info">Oct 7, 2016</div><div class="post-content"><p>AFNetworking 3.1.0 主要是对NSURLSession做了封装.</p>
+<pre><code>- 核心类是AFURLSessionManager.
+- 其派生子类AFHTTPSessionManager基于HTTP协议的请求方式进一步封装了GET, HEAD, POST, PATCH, DELETE, PUT等方法.
+- AFURLRequestSerialization提供了请求序列化
+- AFURLResponseSerialization把收到的二进制数据序列化成JSON, XML,HTTP, PropertyList, Image等便于解析的格式。
+- AFNetworkReachabilityManager监测网络状态
+- AFSecurityPolicy提供安全验证机制
+</code></pre><p></p><h2><strong>AFURLSessionManager</strong></h2><br>这个模块主要包括两个类：<strong>AFURLSessionManager</strong>和<strong>AFURLSessionManagerTaskDelegate</strong>.<br>AFURLSessionManager用NSURLSessionConfiguration来初始化，并维护<p></p>
+<blockquote>
+<p>1.一个NSOperationQueue,<br>2.一个responseSerializer（默认JSON）<br>3.securityPolicy<br>4.reachabilityManager<br>5.一个存储taskID和TaskDelegate的字典来维护task，读写锁保护(NSLock)</p>
+</blockquote>
+<p>configuration可以设置cache policy，timeout，networkService, TSL, cookie, HTTPHeader, Credential Storage等。</p>
+<p>AFURLSessionManager主要实现了四个协议:</p>
+<blockquote>
+<p>NSURLSessionDelegate（处理session失效和验证）<br>NSURLSessionTaskDelegate（普通的请求任务处理）<br>NSURLSessionDataDelegate（数据处理）<br>NSURLSessionDownloadDelegate（下载任务处理）</p>
+</blockquote>
+<p>每个实现的协议方法都有一个对应的block，方法调用的时候执行block，如果没有再执行默认操作。</p>
+<p>把任务完成，数据处理，上传下载进度管理，下载完成后文件拷贝等部分独立出来，专门用一个类AFURLSessionManagerTaskDelegate来管理，所以这个类也实现了后3个协议。</p>
+<p>这个模块中有<font color="red">两个全局的dispatch_queue：</font></p>
+<font color="black">1. 一个是串行队列用于创建任务<br>    dataTask(普通任务), uploadTask, downloadTask以dispatch_sync的方式放入队列<br>2. 一个是并发队列用于处理任务<br>    NSURLSessionTaskDelegate的didComplete方法，如果没有错误，把响应序列化，完成处理等封装成一个block放入此并发队列中。<br><br>3. 还有一个dispatch_group_t，用来管理维护所有task的completionBlock。完成回调的处理在主队列里面。</font>
+
+<p>另外，SessionManager还维护了一个NSOperationQueue, 这个队列的最大并发数是1，等于串行。这个队列是用来处理NSURLSession的delegate回调和session的completion回调。这个completion回调是等到session中所有的data, upload, download task都结束的时候调的。这个回调主要做了一件事，给所有的task设置一个taskDelegate。既然所有任务都结束了，此刻的delegate设置有什么用呢？并且在创建任务的时候就已经设置过taskDelegate了。</p>
+<p>那么跑一个程序看一下。</p>
+<p>客户端发起第一个请求Get</p>
+<ol>
+<li>创建请求的时候发生在main queue里，如果iOS8以下是在创建任务的串行队列里</li>
+<li><strong>NSURLSessionDelegate</strong>的<strong>didReceiveChallenge</strong>得到调用，此时运行在NSOperationQueue。</li>
+<li>NSURLSessionDataDelegate的didReceiveData得到调用，此时运行在NSOperationQueue</li>
+<li>sessionManager的NSURLSessionTaskDelegate的didCompleteWithError得到调用，方法中再去调用taskDelegate的didCompleteWithError方法，此时运行在NSOperationQueue。response序列化在processing_dispatch_queue中调用，taskDelegate在此方法中被移除。</li>
+</ol>
+<p>可以看出所有delegate的方法回调都是在session的operationQueue里发生，请求创建在main queue或者<strong>create_dispatch_queue</strong>中发生，response序列化在<strong>processing_dispatch_queue</strong>里发生。创建结束并没有调用session的completionHandler，在sessionManager初始化时会调用一次，此时没有task。进到getTasksWithCompletionHandler方法定义处，发现注释completionHandler是用来处理未解决的data, upload, download task，猜想应该是在session意外invalide的时候，若此时有未解决的task，在session结束之前会在这里集中处理一遍。</p>
+<hr>
+<p></p><h1><strong>技巧</strong></h1><p></p>
+<h3>1.<strong>NSStringFromSelector(_cmd)</strong>获取当前运行方法的名字</h3>
+
+<h3>2.信号量</h3>
+
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div></pre></td><td class="code"><pre><div class="line">dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);//创建一个信号量计数==0</div><div class="line">dispatch_semaphore_signal(semaphore);//计数+1</div><div class="line">dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);//如果semaphore计数&gt;=1,计数-1，返回，程序继续运行；如果计数==0，一直等待</div></pre></td></tr></table></figure>
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div><div class="line">5</div><div class="line">6</div><div class="line">7</div><div class="line">8</div><div class="line">9</div><div class="line">10</div><div class="line">11</div><div class="line">12</div><div class="line">13</div><div class="line">14</div><div class="line">15</div><div class="line">16</div><div class="line">17</div><div class="line">18</div></pre></td><td class="code"><pre><div class="line">- (NSArray *)tasksForKeyPath:(NSString *)keyPath &#123;</div><div class="line">   	__block NSArray *tasks = nil;</div><div class="line">   	dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);</div><div class="line">   	[self.session getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) &#123;</div><div class="line">      	 if ([keyPath isEqualToString:NSStringFromSelector(@selector(dataTasks))]) &#123;</div><div class="line">           tasks = dataTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(uploadTasks))]) &#123;</div><div class="line">           tasks = uploadTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(downloadTasks))]) &#123;</div><div class="line">           tasks = downloadTasks;</div><div class="line">       &#125; else if ([keyPath isEqualToString:NSStringFromSelector(@selector(tasks))]) &#123;</div><div class="line">           tasks = [@[dataTasks, uploadTasks, downloadTasks] valueForKeyPath:@&quot;@unionOfArrays.self&quot;];</div><div class="line">       &#125;</div><div class="line">       	dispatch_semaphore_signal(semaphore);</div><div class="line">   	&#125;];</div><div class="line">  	 dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);</div><div class="line">  	 return tasks;</div><div class="line">&#125;</div></pre></td></tr></table></figure>
+<p>这个方法利用信号量，把异步返回的task，变为同步。也就是说，当CompletionHandler执行前，信号量一直为0，当前线程阻塞直到CompletionHandler执行，信号量+1，返回task。</p>
+<h3>3.用method_swizzling给resume和suspend方法加上发通知</h3>
+
+<h3>4.对某处的代码忽略警告。push存储GCC的当前诊断状态，pop恢复到存储的诊断状态，push和pop使忽略效果只在之间生效。</h3>
+
+
+<figure class="highlight plain"><table><tr><td class="gutter"><pre><div class="line">1</div><div class="line">2</div><div class="line">3</div><div class="line">4</div></pre></td><td class="code"><pre><div class="line">#pragma GCC diagnostic push</div><div class="line">#pragma GCC diagnostic ignored &quot;-Wnonnull&quot;</div><div class="line">        NSURLSessionDataTask *localDataTask = [session dataTaskWithURL:nil];</div><div class="line">#pragma clang diagnostic pop</div></pre></td></tr></table></figure></div></article></div></section><footer><div class="paginator"><a href="/2016/10/07/高效地给图片加圆角/" class="next">下一篇</a></div><div class="copyright"><p>© 2016 <a href="https://anglezhou.github.io">Zhou Qian</a>, powered by <a href="https://hexo.io/" target="_blank">Hexo</a> and <a href="https://github.com/pinggod/hexo-theme-apollo" target="_blank">hexo-theme-apollo</a>.</p></div></footer></div><script async src="//cdn.bootcss.com/mathjax/2.6.1/MathJax.js?config=TeX-MML-AM_CHTML"></script><script>(function(b,o,i,l,e,r){b.GoogleAnalyticsObject=l;b[l]||(b[l]=function(){(b[l].q=b[l].q||[]).push(arguments)});b[l].l=+new Date;e=o.createElement(i);r=o.getElementsByTagName(i)[0];e.src='//www.google-analytics.com/analytics.js';r.parentNode.insertBefore(e,r)}(window,document,'script','ga'));ga('create',"UA-65933410-1",'auto');ga('send','pageview');</script></body></html>
